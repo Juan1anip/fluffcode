@@ -89,3 +89,9 @@ The agent wraps all terminal commands in `<cmd>...</cmd>` tags. Before any comma
 ## 📄 License
 
 Distributed under the MIT License. See `LICENSE` for more information.
+
+## ☕ Support the Developer
+
+If this agent saves you time, and if you use my other open-source workflow tools, consider supporting the development. Your backing helps keep these small AI tools projects completely free.
+
+[![Support me on Patreon](https://img.shields.io/badge/Patreon-Support%20Me-F96854?style=for-the-badge&logo=patreon)](https://patreon.com/netizen4_bit)
