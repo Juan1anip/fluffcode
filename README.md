@@ -1,6 +1,6 @@
 # AI Agent for Android OS
 
-An autonomous AI terminal agent for Android that writes code, manages files, and runs shell commands automatically directly inside Termux. Built specifically to run on 32-bit (armv7l) phones as well as modern 64-bit devices.
+An autonomous AI terminal agent for Android that writes code, manages files, and runs shell commands automatically directly inside Termux. Built specifically to run on 32-bit (armv7l) phones as well as modern 64-bit devices. It requires less than 50 MB of memory, providing a truly lightweight agentic workflow on your phone.
 
 This agent connects directly to the Google Gemini API using only Python's built-in standard libraries. It turns an old or spare Android device into an autonomous programming assistant: describe a task, and the agent writes the code, inspects errors, executes shell commands, and loops automatically until the job is done—all with an interactive (y/n) safety prompt before running any command on your device.
 
