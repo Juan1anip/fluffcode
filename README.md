@@ -30,8 +30,8 @@ pkg update -y && pkg install git python -y
 
 Clone this repository and enter the project folder:
 ```bash
-git clone https://github.com/YOUR_USERNAME/termux-gemini-agent.git
-cd termux-gemini-agent
+git clone https://github.com/netizen4-bit/agent042.git
+cd agent042
 ```
 
 ## 🔑 Getting Your Free API Key
@@ -57,7 +57,7 @@ Once running, type your request. The agent will respond, generate code, and prom
 ## 📁 Project Structure
 
 ```plaintext
-termux-gemini-agent/
+agent042/
 ├── agent.py            # The core autonomous execution loop (pure Python standard library)
 ├── Termux_32bit.apk    # Offline bundled 32-bit Termux installer for legacy devices
 ├── README.md           # Documentation and setup guide
