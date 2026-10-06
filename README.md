@@ -1,4 +1,4 @@
-# Termux Gemini Autonomous Agent
+# AI Agent for Android OS
 
 An autonomous AI terminal agent for Android that writes code, manages files, and runs shell commands automatically directly inside Termux. Built specifically to run on 32-bit (armv7l) phones as well as modern 64-bit devices.
 
