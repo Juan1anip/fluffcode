@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent042-fork — Termux coding agent with native tool calling.
+fluffcode — Termux coding agent with native tool calling.
 
 Fork of netizen4-bit/agent042, rebuilt by Juan1anip.
 
@@ -56,7 +56,7 @@ def clear_screen():
 
 BANNER = f"""{C.MAGENTA}{C.BOLD}
    ┌─────────────────────────────────────────┐
-   │   agent042 · v{VERSION} · multi-provider   │
+   │   fluffcode · v{VERSION} · multi-provider   │
    └─────────────────────────────────────────┘{C.RESET}
 """
 
@@ -591,7 +591,7 @@ def ensure_model(provider=None, quiet=False):
 # System prompt
 # ══════════════════════════════════════════════════════════════════════
 
-BASE_SYSTEM_PROMPT = """You are agent042, a coding agent running in Termux on an Android phone.
+BASE_SYSTEM_PROMPT = """You are fluffcode, a coding agent running in Termux on an Android phone.
 
 You help the user by reading, writing, and running things in their workspace.
 
@@ -1416,7 +1416,7 @@ def _call_openai(contents, stream=True):
     }
     if provider == "openrouter":
         headers["HTTP-Referer"] = "http://localhost"
-        headers["X-Title"] = "agent042"
+        headers["X-Title"] = "fluffcode"
 
     url = conf["chat_url"]
     resp = None
@@ -1954,11 +1954,11 @@ def show_sessions():
 def show_about():
     clear_screen()
     print(BANNER)
-    print(f"{C.BOLD}agent042 · v{VERSION}{C.RESET}")
+    print(f"{C.BOLD}fluffcode · v{VERSION}{C.RESET}")
     print(f"{C.GREY}a terminal coding agent for Termux{C.RESET}\n")
     print(f"  fork of {C.CYAN}netizen4-bit/agent042{C.RESET}")
     print(f"  rebuilt by {C.CYAN}Juan1anip{C.RESET}")
-    print(f"  {C.GREY}github.com/Juan1anip/agent042{C.RESET}\n")
+    print(f"  {C.GREY}github.com/Juan1anip/fluffcode{C.RESET}\n")
     print(f"  {C.BOLD}providers{C.RESET}")
     for name in PROVIDER_ORDER:
         conf = PROVIDERS[name]
