@@ -1,97 +1,37 @@
-# AI Agent for Android OS
+# agent042-fork
 
-An autonomous AI terminal agent for Android that writes code, manages files, and runs shell commands automatically directly inside Termux. Built specifically to run on 32-bit (armv7l) phones as well as modern 64-bit devices. It requires less than 50 MB of memory, providing lightweight agentic workflow on your phone.
+A fork of [netizen4-bit/agent042](https://github.com/netizen4-bit/agent042) — a Termux autonomous agent for Android.
 
-This agent connects directly to the Google Gemini API using only Python's built-in standard libraries. It turns an old or spare Android device into an autonomous programming assistant: describe a task, and the agent writes the code, inspects errors, executes shell commands, and loops automatically until the job is done—all with an interactive (y/n) safety prompt before running any command on your device.
+**Forked and rebuilt by [@Juan1anip](https://github.com/Juan1anip).**
 
-## 🛠️ Prerequisites
+## What's different from upstream
 
-Before getting started, make sure you have:
-* **An Android Device** — Any phone running Android 7.0 or newer (works on 32-bit ARM and modern 64-bit phones).
-* **Termux Installed** — Downloaded directly from this repository (for older devices) or the official release page.
-* **A Free Gemini API Key** — From Google AI Studio (no credit card or paid subscription needed).
+The original had a real bug: it passed an empty list where the conversation history was supposed to go. Every reply was generated with zero context — the agent had amnesia between messages. This fork fixes that and adds the things that make it actually usable.
 
-## 🚀 Quick Start Guide
+### Fixes
+- **Conversation memory** — history is passed to Gemini correctly and assistant replies are appended back
+- **Working model name** — auto-discovered at runtime instead of hardcoded
+- **Rate limit handling** — retries 429/5xx with backoff instead of exiting
+- **Multiple commands per turn** — all `<cmd>` blocks run, not just the first
+- **Subprocess timeout** — hung commands die after 60s
+- **Ctrl-C** kills the running command, not the agent
+- **Safety filter** — refuses `rm -rf /`, `mkfs`, fork bombs
+- **Auto-approve safe reads** — `ls`, `cat`, `df`, etc. run without prompting
 
-### Step 1: Install Termux on Your Phone
+### New features
+- **Auto-model discovery** — fetches Google's live model list on startup and picks the newest Flash
+- **404 auto-recovery** — if the model gets retired mid-session, catches the error, switches, and retries
+- **Sessions** — history persists across restarts (`/save`, `/load`, `/list`)
+- **Streaming** — see tokens as they arrive
+- **Token usage** — printed after each reply
+- **Slash commands** — `/help`, `/models`, `/refresh-models`, `/context`, `/undo`, `/model`, `/stream`, `/approve-all`, `/exit`
+- **Colored output** — model text, commands, and results are visually distinct
 
-Choose the right version for your device:
-* **For Legacy 32-bit Phones (older devices):** Download and install `Termux_32bit.apk` directly from this repository: https://github.com/termux/termux-app/releases/download/v0.118.1/termux-app_v0.118.1+github-debug_armeabi-v7a.apk
-* **For Modern 64-bit Phones (Pixel 7+, Galaxy S24+, Android 14+):** Download the official 64-bit APK directly from [Termux GitHub Releases (arm64-v8a)](https://github.com/termux/termux-app/releases/download/v0.118.1/termux-app_v0.118.1+github-debug_arm64-v8a.apk).
+## Install
 
-### Step 2: Set Up the Environment
-
-Open the Termux app and run these commands to update package lists and install Git and Python:
 ```bash
 pkg update -y && pkg install git python -y
-```
-
-### Step 3: Clone the Repository
-
-Clone this repository and enter the project folder:
-```bash
-git clone https://github.com/netizen4-bit/agent042.git
-cd agent042
-```
-
-## 🔑 Getting Your Free API Key
-
-⚠️ **IMPORTANT: Avoid Billing Account Errors**
-When creating your key, do not attach a Google Cloud billing account. Projects with depleted prepaid balances will trigger a `402 Payment Required` error. A fresh project with no billing attached gives you access to the permanent free tier (1,500 free requests per day).
-
-1. Visit [Google AI Studio](https://aistudio.google.com/app/apikey).
-2. Sign in with your Google Account and click **Create API key**.
-3. Select **Create a new project** from the dropdown menu (e.g., name it `termux-agent`).
-4. Copy your API key.
-
-## ⚙️ Running the Agent
-
-Export your API key into Termux and start the agent:
-```bash
-export GEMINI_API_KEY="paste_your_api_key_here"
+git clone https://github.com/Juan1anip/agent042.git agent042-fork
+cd agent042-fork
+export GEMINI_API_KEY="your_key_here"
 python3 agent.py
-```
-
-Once running, type your request. The agent will respond, generate code, and prompt for confirmation before running any shell commands on your phone.
-
-## 📁 Project Structure
-
-```plaintext
-agent042/
-├── agent.py            # The core autonomous execution loop (pure Python standard library)
-├── Termux_32bit.apk    # Offline bundled 32-bit Termux installer for legacy devices
-├── README.md           # Documentation and setup guide
-└── LICENSE             # MIT License
-```
-
-## 💬 How to Command the Agent
-
-The agent is designed to understand natural language instructions and translate them into shell commands and scripts.
-
-### Common Task Examples
-
-* **File creation and execution:**
-  "Create a Python script named monitor.py that checks battery status and print the result."
-* **System diagnostics:**
-  "Check available storage space, active RAM usage, and tell me if the system is running low."
-* **Code debugging:**
-  "Look at the error in script.py, explain what is broken, patch it, and test-run it."
-
-### ⚠️ Pro-Tip: Autonomous Execution Safety
-
-The agent wraps all terminal commands in `<cmd>...</cmd>` tags. Before any command executes, you will see:
-```plaintext
-[Agent wants to run: uname -m] Allow? (y/n)
-```
-* Press `y` to approve the command and automatically pass the terminal output back to Gemini.
-* Press `n` to decline the command. The agent will adapt its strategy or ask for alternative instructions.
-
-## 📄 License
-
-Distributed under the MIT License. See `LICENSE` for more information.
-
-## ☕ Support the Developer
-
-If this agent saves you time, and if you use my other open-source workflow tools, consider supporting the development. Your backing helps keep these small AI tools projects completely free.
-
-[![Support me on Patreon](https://img.shields.io/badge/Patreon-Support%20Me-F96854?style=for-the-badge&logo=patreon)](https://patreon.com/netizen4_bit)
