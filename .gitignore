@@ -1,0 +1,6 @@
+
+# agent042 local state
+.agent042/
+*.session
+__pycache__/
+*.pyc
