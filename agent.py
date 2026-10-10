@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-fluffcode — Termux coding agent with native tool calling.
+fluffcode — a lightweight coding agent for Termux on Android.
 
 Fork of netizen4-bit/agent042, rebuilt by Juan1anip.
 
-Version 2.0 — multi-provider:
-  • Providers: Gemini, Groq, OpenRouter, OpenAI
-  • Mid-chat /provider to switch
-  • Per-provider API keys, model cache, and default model
+Version 2.1:
+  • Multi-provider: Gemini, Groq, OpenRouter, OpenAI
+  • Native function calling (Gemini and OpenAI API styles)
+  • 7 tools: read_file, write_file, edit_file, list_dir, glob, grep, run_shell
   • Auto-model discovery (skips non-chat and no-tool variants)
-  • Setup wizard asks for provider, key, name, personality
-  • Native function calling for both API styles
-  • Sessions, streaming, backups, robust error handling
+  • Sessions, streaming, auto-backups, robust error recovery
+  • Security: shell whitelist, path confinement, config protection, audit log
+  • Startup dependency check with optional pkg install
 
-Pure stdlib. Termux-friendly.
+Pure stdlib. Runs on Android 7+ via Termux.
 """
 
 import os
@@ -23,6 +23,7 @@ import json
 import time
 import signal
 import socket
+import shutil
 import subprocess
 import urllib.request
 import urllib.error
@@ -36,7 +37,7 @@ except ImportError:
     readline = None
 
 
-VERSION = "2.0"
+VERSION = "2.1"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -56,7 +57,7 @@ def clear_screen():
 
 BANNER = f"""{C.MAGENTA}{C.BOLD}
    ┌─────────────────────────────────────────┐
-   │   fluffcode · v{VERSION} · multi-provider   │
+   │   fluffcode · v{VERSION} · multi-provider  │
    └─────────────────────────────────────────┘{C.RESET}
 """
 
@@ -72,6 +73,7 @@ BACKUP_DIR = AGENT_DIR / "backups"
 CACHE_DIR = AGENT_DIR / "cache"
 CONFIG_PATH = AGENT_DIR / "config.json"
 HISTORY_PATH = AGENT_DIR / "history"
+AUDIT_LOG = AGENT_DIR / "audit.log"
 
 for d in (AGENT_DIR, SESSIONS_DIR, BACKUP_DIR, CACHE_DIR):
     d.mkdir(parents=True, exist_ok=True)
@@ -141,6 +143,70 @@ def detect_provider_from_key(key):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# Shell safety
+# ══════════════════════════════════════════════════════════════════════
+
+# Commands whose first token is on this list run without prompting.
+ALLOWED_SHELL_FIRST_TOKEN = {
+    # file inspection
+    "ls", "pwd", "cat", "head", "tail", "wc", "file", "stat",
+    "readlink", "realpath", "which", "type", "command", "tree",
+    # search
+    "grep", "find", "rg", "fd",
+    # dev tools
+    "git", "python", "python3", "pip", "pip3", "pkg",
+    "node", "npm", "npx", "go", "cargo", "rustc", "make", "cmake",
+    # system info
+    "uname", "whoami", "date", "df", "du", "free", "ps", "uptime",
+    "env", "printenv", "termux-info", "termux-battery-status",
+    "termux-wifi-connectioninfo", "termux-location",
+    # text
+    "echo", "printf", "sed", "awk", "tr", "cut", "sort", "uniq",
+    "tee", "xargs", "base64",
+    # dirs and files
+    "mkdir", "touch", "cp", "mv", "ln",
+    # archives
+    "tar", "gzip", "gunzip", "zip", "unzip",
+    # misc
+    "sleep", "true", "false", "test", "expr", "seq",
+}
+
+# Patterns refused outright, regardless of user approval.
+BLOCKED_CMD = (
+    "rm -rf /", "rm -rf /*", "mkfs", "dd if=/dev/zero",
+    ":(){:|:&};:", "> /dev/sd", "> /system/", "> /data/",
+    "shutdown", "reboot", "chmod 777 /",
+)
+
+
+def _classify_shell(cmd):
+    """Return 'blocked', 'safe', or 'unsafe'."""
+    c = (cmd or "").strip()
+    if not c:
+        return "blocked"
+
+    for pattern in BLOCKED_CMD:
+        if pattern in c:
+            return "blocked"
+
+    tokens = c.split()
+    first = tokens[0] if tokens else ""
+    if "=" in first and not first.startswith("-"):
+        rest = c.split(None, 1)
+        if len(rest) > 1:
+            sub = rest[1].split()
+            first = sub[0] if sub else ""
+
+    first = re.split(r"[;|&<>]", first)[0]
+    if not first:
+        return "unsafe"
+
+    if first in ALLOWED_SHELL_FIRST_TOKEN:
+        return "safe"
+    return "unsafe"
+
+
+# ══════════════════════════════════════════════════════════════════════
 # Config
 # ══════════════════════════════════════════════════════════════════════
 
@@ -171,23 +237,15 @@ CONFIG = json.loads(json.dumps(DEFAULT_CONFIG))
 
 
 def _migrate_old_config(saved):
-    """
-    Old format had: api_key, model, base_url, models_url at the top level.
-    Migrate into providers.gemini (the only provider the old code supported).
-    """
     if "providers" in saved and "active_provider" in saved:
-        return saved  # already new format
-
+        return saved
     old_key = saved.get("api_key", "")
     old_model = saved.get("model", "")
     if not old_key and not old_model:
-        return saved  # nothing to migrate
-
+        return saved
     new = dict(saved)
-    new.pop("api_key", None)
-    new.pop("model", None)
-    new.pop("base_url", None)
-    new.pop("models_url", None)
+    for k in ("api_key", "model", "base_url", "models_url"):
+        new.pop(k, None)
     new.setdefault("providers", {n: _blank_provider_state() for n in PROVIDERS})
     new["providers"]["gemini"] = {"api_key": old_key, "model": old_model}
     new["active_provider"] = "gemini"
@@ -197,17 +255,13 @@ def _migrate_old_config(saved):
 def load_config():
     global CONFIG
     CONFIG = json.loads(json.dumps(DEFAULT_CONFIG))
-
     if not CONFIG_PATH.exists():
         return
-
     try:
         saved = json.loads(CONFIG_PATH.read_text())
     except Exception:
         return
-
     saved = _migrate_old_config(saved)
-
     for k, v in saved.items():
         if k == "providers":
             for name, state in v.items():
@@ -238,10 +292,6 @@ def active_provider():
         p = "gemini"
         CONFIG["active_provider"] = p
     return p
-
-
-def provider_conf(name=None):
-    return PROVIDERS[active_provider() if name is None else name]
 
 
 def provider_state(name=None):
@@ -277,6 +327,52 @@ def get_workspace():
 
 
 # ══════════════════════════════════════════════════════════════════════
+# Startup dependency check
+# ══════════════════════════════════════════════════════════════════════
+
+def check_dependencies():
+    """
+    Verify common tools are present. Offer to install anything missing
+    via pkg. Non-fatal — the agent runs either way.
+    """
+    needed = ["python3", "git"]
+    missing = [t for t in needed if not shutil.which(t)]
+
+    if not missing:
+        return
+
+    print(f"{C.YELLOW}  ⚠ missing tools: {', '.join(missing)}{C.RESET}")
+    print(f"{C.GREY}  not required, but some features won't work without them{C.RESET}")
+
+    if not shutil.which("pkg"):
+        print(f"{C.GREY}  (pkg not found — install manually){C.RESET}\n")
+        return
+
+    try:
+        ans = input(f"  {C.CYAN}install now? [y/N] {C.RESET}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+
+    if ans != "y":
+        print()
+        return
+
+    print(f"{C.GREY}  › running pkg install…{C.RESET}")
+    try:
+        r = subprocess.run(
+            ["pkg", "install", "-y"] + missing,
+            capture_output=True, text=True, timeout=180,
+        )
+        if r.returncode == 0:
+            print(f"{C.GREEN}  ✓ installed: {', '.join(missing)}{C.RESET}\n")
+        else:
+            print(f"{C.RED}  ✗ install failed (exit {r.returncode}){C.RESET}\n")
+    except Exception as e:
+        print(f"{C.RED}  ✗ install error: {e}{C.RESET}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # Input helper
 # ══════════════════════════════════════════════════════════════════════
 
@@ -298,7 +394,6 @@ def pause(msg="press enter to continue..."):
 
 
 def pick_number(prompt, options):
-    """Numbered menu. Returns index or None."""
     print(f"{C.CYAN}?{C.RESET} {prompt}")
     for i, label in enumerate(options, 1):
         print(f"    {C.YELLOW}{i}{C.RESET}. {label}")
@@ -329,7 +424,6 @@ def run_setup_wizard():
     print(f"{C.BOLD}welcome to first-time setup{C.RESET}")
     print(f"{C.GREY}this takes about 30 seconds{C.RESET}\n")
 
-    # ── name ──
     print(f"{C.BOLD}step 1 of 4{C.RESET} — what should I call you?")
     name = ask("your name", default="friend")
     if name is None:
@@ -337,7 +431,6 @@ def run_setup_wizard():
     name = name.strip()[:40] or "friend"
     print(f"{C.GREEN}  ✓ nice to meet you, {name}{C.RESET}\n")
 
-    # ── provider ──
     print(f"{C.BOLD}step 2 of 4{C.RESET} — which AI provider?")
     print(f"{C.GREY}pick one to start. You can add more later in settings.{C.RESET}\n")
     opts = []
@@ -350,7 +443,6 @@ def run_setup_wizard():
     provider = PROVIDER_ORDER[idx]
     print(f"{C.GREEN}  ✓ {PROVIDERS[provider]['label']}{C.RESET}\n")
 
-    # ── key ──
     print(f"{C.BOLD}step 3 of 4{C.RESET} — {PROVIDERS[provider]['label']} API key")
     print(f"{C.GREY}free key: {PROVIDERS[provider]['signup']}{C.RESET}")
     print(f"{C.GREY}{PROVIDERS[provider]['key_hint']}{C.RESET}\n")
@@ -366,15 +458,13 @@ def run_setup_wizard():
             continue
         detected = detect_provider_from_key(k)
         if detected and detected != provider:
-            print(f"{C.YELLOW}  that looks like a {PROVIDERS[detected]['label']} key, "
-                  f"not {PROVIDERS[provider]['label']}{C.RESET}")
+            print(f"{C.YELLOW}  that looks like a {PROVIDERS[detected]['label']} key{C.RESET}")
             cont = ask(f"switch to {PROVIDERS[detected]['label']}? [y/N]", default="y")
             if cont and cont.lower() == "y":
                 provider = detected
         key = k
     print(f"{C.GREEN}  ✓ key saved{C.RESET}\n")
 
-    # ── personality ──
     print(f"{C.BOLD}step 4 of 4{C.RESET} — optional custom personality")
     print(f"{C.GREY}examples:{C.RESET}")
     print(f"{C.GREY}  \"you are a grumpy pirate who hates small talk\"{C.RESET}")
@@ -416,7 +506,6 @@ _EXCLUDE_KEYWORDS = (
     "vision-only", "aqa",
     "babbage", "davinci", "curie", "ada-",
     "rerank", "search",
-    # Gemini-specific non-chat variants
     "learnlm", "gemma-",
 )
 
@@ -427,7 +516,6 @@ def _is_usable(name):
 
 
 def _vkey(name):
-    """Extract a version-ish tuple from a model name."""
     m = re.search(r"(\d+)(?:\.(\d+))?", name)
     if not m:
         return (0, 0)
@@ -435,19 +523,11 @@ def _vkey(name):
 
 
 def _score_model(name, provider):
-    """
-    Return (score, version_tuple). Higher = better. Penalties for small
-    or preview models. Boosts for known-good chat models.
-    """
     n = name.lower()
-
-    # Hard disqualify
     for bad in ("lite", "thinking", "vision-", "preview-3d"):
         if bad in n:
             return (-999, (0, 0))
-
     score = 0
-
     if provider == "gemini":
         if "flash" in n: score += 30
         if "pro" in n: score += 20
@@ -464,7 +544,6 @@ def _score_model(name, provider):
         if "gpt-oss-20b" in n: score += 25
         if "qwen" in n: score += 15
     elif provider == "openrouter":
-        # Prefer free
         if ":free" in n: score += 40
         if "claude" in n: score += 30
         if "gpt-" in n: score += 25
@@ -477,7 +556,6 @@ def _score_model(name, provider):
         if "gpt-4o-mini" in n: score += 25
         if "gpt-4-turbo" in n: score += 20
         if "gpt-3.5" in n: score -= 10
-
     return (score, _vkey(name))
 
 
@@ -486,12 +564,10 @@ def _model_cache_path(provider):
 
 
 def discover_models(provider=None, use_cache=True, quiet=False):
-    """Fetch available chat models from the provider's API."""
     provider = provider or active_provider()
     conf = PROVIDERS.get(provider)
     if not conf:
         return []
-
     api_key = get_api_key(provider)
     if not api_key:
         return []
@@ -543,10 +619,8 @@ def discover_models(provider=None, use_cache=True, quiet=False):
             if _is_usable(name):
                 names.append(name)
 
-    # Rank
     names.sort(key=lambda n: _score_model(n, provider), reverse=True)
     models = [{"name": n} for n in names]
-
     try:
         cache_path.write_text(json.dumps({"ts": time.time(), "models": models}))
     except Exception:
@@ -560,7 +634,6 @@ def pick_best(provider, models):
         return None
     usable.sort(key=lambda m: _score_model(m["name"], provider), reverse=True)
     best = usable[0]["name"]
-    # If best has -999 score, nothing usable
     if _score_model(best, provider)[0] <= -999:
         return None
     return best
@@ -570,13 +643,11 @@ def ensure_model(provider=None, quiet=False):
     provider = provider or active_provider()
     if not get_api_key(provider):
         return False
-
     current = get_model(provider)
     if current:
         cached = discover_models(provider, use_cache=True, quiet=True)
         if cached and current in [m["name"] for m in cached]:
             return True
-
     models = discover_models(provider, use_cache=False, quiet=quiet)
     best = pick_best(provider, models)
     if best:
@@ -599,27 +670,12 @@ You have REAL tools. Call them through the API — do not fake tool calls in tex
 
 Tools:
   read_file(path, offset=0, limit=500)
-      Read a file. Lines are numbered. Page through big files with offset/limit.
-
   write_file(path, content)
-      Create or overwrite a file. Creates parent dirs.
-
   edit_file(path, old_string, new_string)
-      Exact string replacement. old_string must be unique.
-      Use this for surgical edits — do NOT rewrite whole files.
-
   list_dir(path=".")
-      List files in a directory.
-
   glob(pattern, path=".")
-      Find files by glob pattern, e.g. "**/*.py". Use narrow patterns —
-      never "**/*" at the workspace root.
-
   grep(pattern, path=".", glob=None)
-      Regex search across file contents. Returns path:line:match.
-
   run_shell(command, timeout=60)
-      Run a shell command. For git, pip, python, tests, pkg.
 
 Workflow:
   1. Explore first. Use list_dir, glob, grep, read_file.
@@ -633,6 +689,7 @@ Rules:
   - Read before you write.
   - Keep responses short. No emojis.
   - Only Termux-compatible commands (no sudo, no apt — use pkg).
+  - File access is confined to the workspace. Paths outside are refused.
   - If a task is ambiguous, do a minimal exploration first, then ask.
 """
 
@@ -645,10 +702,7 @@ def build_system_prompt():
                      f"occasionally, but don't overdo it.")
     custom = (CONFIG.get("custom_prompt") or "").strip()
     if custom:
-        parts.append(
-            "Additional instructions from the user (follow these):\n"
-            f"{custom}"
-        )
+        parts.append("Additional instructions from the user (follow these):\n" + custom)
     return "\n\n".join(parts)
 
 
@@ -657,121 +711,68 @@ def build_system_prompt():
 # ══════════════════════════════════════════════════════════════════════
 
 TOOL_DEFS = [
-    {
-        "name": "read_file",
-        "description": "Read a text file with line numbers. Page through large files with offset and limit.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path":   {"type": "string"},
-                "offset": {"type": "integer"},
-                "limit":  {"type": "integer"},
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": "Write a file. Creates parent dirs. Overwrites if it exists.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path":    {"type": "string"},
-                "content": {"type": "string"},
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "edit_file",
-        "description": "Replace an exact string in a file. old_string must appear exactly once.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "path":       {"type": "string"},
-                "old_string": {"type": "string"},
-                "new_string": {"type": "string"},
-            },
-            "required": ["path", "old_string", "new_string"],
-        },
-    },
-    {
-        "name": "list_dir",
-        "description": "List files and directories.",
-        "parameters": {
-            "type": "object",
-            "properties": {"path": {"type": "string"}},
-        },
-    },
-    {
-        "name": "glob",
-        "description": "Find files by glob pattern.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string"},
-                "path":    {"type": "string"},
-            },
-            "required": ["pattern"],
-        },
-    },
-    {
-        "name": "grep",
-        "description": "Regex search across files.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string"},
-                "path":    {"type": "string"},
-                "glob":    {"type": "string"},
-            },
-            "required": ["pattern"],
-        },
-    },
-    {
-        "name": "run_shell",
-        "description": "Run a shell command in the workspace.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string"},
-                "timeout": {"type": "integer"},
-            },
-            "required": ["command"],
-        },
-    },
+    {"name": "read_file",
+     "description": "Read a text file with line numbers. Page through large files with offset and limit.",
+     "parameters": {"type": "object",
+                    "properties": {"path": {"type": "string"},
+                                   "offset": {"type": "integer"},
+                                   "limit": {"type": "integer"}},
+                    "required": ["path"]}},
+    {"name": "write_file",
+     "description": "Write a file. Creates parent dirs. Overwrites if it exists.",
+     "parameters": {"type": "object",
+                    "properties": {"path": {"type": "string"},
+                                   "content": {"type": "string"}},
+                    "required": ["path", "content"]}},
+    {"name": "edit_file",
+     "description": "Replace an exact string in a file. old_string must appear exactly once.",
+     "parameters": {"type": "object",
+                    "properties": {"path": {"type": "string"},
+                                   "old_string": {"type": "string"},
+                                   "new_string": {"type": "string"}},
+                    "required": ["path", "old_string", "new_string"]}},
+    {"name": "list_dir",
+     "description": "List files and directories.",
+     "parameters": {"type": "object",
+                    "properties": {"path": {"type": "string"}}}},
+    {"name": "glob",
+     "description": "Find files by glob pattern.",
+     "parameters": {"type": "object",
+                    "properties": {"pattern": {"type": "string"},
+                                   "path": {"type": "string"}},
+                    "required": ["pattern"]}},
+    {"name": "grep",
+     "description": "Regex search across files.",
+     "parameters": {"type": "object",
+                    "properties": {"pattern": {"type": "string"},
+                                   "path": {"type": "string"},
+                                   "glob": {"type": "string"}},
+                    "required": ["pattern"]}},
+    {"name": "run_shell",
+     "description": "Run a shell command in the workspace.",
+     "parameters": {"type": "object",
+                    "properties": {"command": {"type": "string"},
+                                   "timeout": {"type": "integer"}},
+                    "required": ["command"]}},
 ]
 
 
 def get_gemini_tools():
-    return [{
-        "function_declarations": [
-            {
-                "name": t["name"],
-                "description": t["description"],
-                "parameters": t["parameters"],
-            }
-            for t in TOOL_DEFS
-        ]
-    }]
+    return [{"function_declarations": [
+        {"name": t["name"], "description": t["description"], "parameters": t["parameters"]}
+        for t in TOOL_DEFS
+    ]}]
 
 
 def get_openai_tools():
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t["description"],
-                "parameters": t["parameters"],
-            },
-        }
-        for t in TOOL_DEFS
-    ]
+    return [{"type": "function",
+             "function": {"name": t["name"], "description": t["description"],
+                          "parameters": t["parameters"]}}
+            for t in TOOL_DEFS]
 
 
 # ══════════════════════════════════════════════════════════════════════
-# Tool implementations
+# Path safety
 # ══════════════════════════════════════════════════════════════════════
 
 SKIP_DIRS = {".git", ".cache", "__pycache__", "node_modules", ".venv",
@@ -779,17 +780,39 @@ SKIP_DIRS = {".git", ".cache", "__pycache__", "node_modules", ".venv",
 
 
 def _safe(path_str, workspace):
-    p = Path(str(path_str)).expanduser()
-    if not p.is_absolute():
-        p = workspace / p
+    """
+    Resolve a path. Returns (path, None) on success, (None, error) on failure.
+    Confines to workspace and blocks ~/.agent042.
+    """
     try:
-        return p.resolve()
-    except Exception:
-        return p
+        p = Path(str(path_str)).expanduser()
+        if not p.is_absolute():
+            p = workspace / p
+        p = p.resolve()
+    except Exception as e:
+        return None, f"ERROR: could not resolve path: {e}"
 
+    try:
+        p.relative_to(AGENT_DIR.resolve())
+        return None, "ERROR: access to ~/.agent042 is blocked"
+    except ValueError:
+        pass
+
+    try:
+        p.relative_to(Path(workspace).resolve())
+    except ValueError:
+        return None, f"ERROR: path outside workspace: {p}"
+    return p, None
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Tool implementations
+# ══════════════════════════════════════════════════════════════════════
 
 def tool_read_file(path, offset=0, limit=None, workspace=None):
-    p = _safe(path, workspace)
+    p, err = _safe(path, workspace)
+    if err:
+        return err
     if not p.exists():
         return f"ERROR: not found: {p}"
     if not p.is_file():
@@ -827,7 +850,9 @@ def _backup(p):
 
 
 def tool_write_file(path, content, workspace=None):
-    p = _safe(path, workspace)
+    p, err = _safe(path, workspace)
+    if err:
+        return err
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         _backup(p)
@@ -842,7 +867,9 @@ def tool_write_file(path, content, workspace=None):
 
 
 def tool_edit_file(path, old_string, new_string, workspace=None):
-    p = _safe(path, workspace)
+    p, err = _safe(path, workspace)
+    if err:
+        return err
     if not p.exists():
         return f"ERROR: not found: {p}"
     try:
@@ -863,7 +890,9 @@ def tool_edit_file(path, old_string, new_string, workspace=None):
 
 
 def tool_list_dir(path=".", workspace=None):
-    p = _safe(path, workspace)
+    p, err = _safe(path, workspace)
+    if err:
+        return err
     if not p.exists():
         return f"ERROR: not found: {p}"
     if not p.is_dir():
@@ -887,7 +916,9 @@ def tool_list_dir(path=".", workspace=None):
 
 
 def tool_glob(pattern, path=".", workspace=None):
-    root = _safe(path, workspace)
+    root, err = _safe(path, workspace)
+    if err:
+        return err
     if not root.exists():
         return f"ERROR: not found: {root}"
     try:
@@ -895,17 +926,27 @@ def tool_glob(pattern, path=".", workspace=None):
     except Exception as e:
         return f"ERROR: {e}"
     out = []
+    ws = Path(workspace).resolve()
     for m in matches:
         try:
+            resolved = m.resolve()
+            # confine each match to the workspace
+            try:
+                resolved.relative_to(ws)
+            except ValueError:
+                continue
+            # skip anything inside protected dirs
+            try:
+                resolved.relative_to(AGENT_DIR.resolve())
+                continue
+            except ValueError:
+                pass
             rel = m.relative_to(root)
             if any(part in SKIP_DIRS for part in rel.parts):
                 continue
             if m.is_file() and m.stat().st_size > 5_000_000:
                 continue
-            try:
-                out.append(str(m.relative_to(workspace)))
-            except Exception:
-                out.append(str(m))
+            out.append(str(m.relative_to(ws)))
         except Exception:
             continue
     out.sort()
@@ -920,11 +961,14 @@ def tool_glob(pattern, path=".", workspace=None):
 
 
 def tool_grep(pattern, path=".", glob=None, workspace=None):
-    root = _safe(path, workspace)
+    root, err = _safe(path, workspace)
+    if err:
+        return err
     try:
         rx = re.compile(pattern)
     except re.error as e:
         return f"ERROR: bad regex: {e}"
+    ws = Path(workspace).resolve()
     files = []
     if root.is_file():
         files = [root]
@@ -932,8 +976,17 @@ def tool_grep(pattern, path=".", glob=None, workspace=None):
         try:
             for f in root.rglob(glob if glob else "*"):
                 try:
-                    rel = f.relative_to(root)
-                    if any(part in SKIP_DIRS for part in rel.parts):
+                    resolved = f.resolve()
+                    try:
+                        resolved.relative_to(ws)
+                    except ValueError:
+                        continue
+                    try:
+                        resolved.relative_to(AGENT_DIR.resolve())
+                        continue
+                    except ValueError:
+                        pass
+                    if any(part in SKIP_DIRS for part in f.relative_to(root).parts):
                         continue
                     if not f.is_file():
                         continue
@@ -953,7 +1006,7 @@ def tool_grep(pattern, path=".", glob=None, workspace=None):
         for i, line in enumerate(text.splitlines(), 1):
             if rx.search(line):
                 try:
-                    rel = str(f.relative_to(workspace))
+                    rel = str(f.relative_to(ws))
                 except Exception:
                     rel = str(f)
                 results.append(f"{rel}:{i}: {line[:200]}")
@@ -963,20 +1016,18 @@ def tool_grep(pattern, path=".", glob=None, workspace=None):
     return "\n".join(results) if results else "(no matches)"
 
 
-BLOCKED_CMD = ("rm -rf /", "rm -rf /*", "mkfs", "dd if=/dev/zero",
-               ":(){:|:&};:", "> /dev/sd", "> /system/", "> /data/",
-               "shutdown", "reboot", "chmod 777 /")
-
 CURRENT_PROC = {"proc": None}
 AUTO_SHELL = {"on": False}
 
 
 def tool_run_shell(command, timeout=None, workspace=None):
     cmd = str(command).strip()
-    if any(b in cmd for b in BLOCKED_CMD):
+    classification = _classify_shell(cmd)
+
+    if classification == "blocked":
         return "ERROR: command blocked by safety filter"
 
-    if not AUTO_SHELL["on"]:
+    if classification == "unsafe" and not AUTO_SHELL["on"]:
         print(f"\n{C.YELLOW}  ▸ shell:{C.RESET} {cmd}")
         try:
             ans = input(f"  {C.CYAN}allow? [y/N/a=always] {C.RESET}").strip().lower()
@@ -987,6 +1038,8 @@ def tool_run_shell(command, timeout=None, workspace=None):
             AUTO_SHELL["on"] = True
         elif ans != "y":
             return "(user declined)"
+    else:
+        print(f"\n{C.GREY}  ▸ shell:{C.RESET} {cmd}")
 
     if timeout is None:
         timeout = CONFIG["command_timeout"]
@@ -1026,7 +1079,27 @@ def tool_run_shell(command, timeout=None, workspace=None):
     return f"exit={rc}\n{body}" if body else f"exit={rc}"
 
 
+def _audit_log(tool, args, result):
+    try:
+        entry = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "tool": tool,
+            "args": args,
+            "result_preview": str(result)[:200],
+        }
+        with open(AUDIT_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
 def dispatch_tool(name, args, workspace):
+    result = _dispatch_tool_inner(name, args, workspace)
+    _audit_log(name, args, result)
+    return result
+
+
+def _dispatch_tool_inner(name, args, workspace):
     if name == "read_file":
         return tool_read_file(args.get("path", ""), args.get("offset", 0),
                               args.get("limit"), workspace)
@@ -1137,26 +1210,16 @@ def _try_switch_model(provider):
     return True
 
 
-def _open_http(req, timeout):
-    """urlopen with a fixed error-tuple classifier used by callers."""
-    return urllib.request.urlopen(req, timeout=timeout)
-
-
 # ══════════════════════════════════════════════════════════════════════
 # Conversation conversion (internal = Gemini format)
 # ══════════════════════════════════════════════════════════════════════
 
 def _to_openai_messages(contents):
-    """
-    Convert our internal (Gemini-shaped) conversation to OpenAI format.
-    Tool-call IDs are synthesized and matched to functionResponses by order.
-    """
     messages = []
     sys_prompt = build_system_prompt()
     if sys_prompt:
         messages.append({"role": "system", "content": sys_prompt})
 
-    # name -> FIFO of call IDs that haven't been answered yet
     id_queues = {}
     counter = [0]
 
@@ -1178,10 +1241,7 @@ def _to_openai_messages(contents):
                     tool_responses.append(part["functionResponse"])
 
             if text_chunks:
-                messages.append({
-                    "role": "user",
-                    "content": "\n".join(text_chunks),
-                })
+                messages.append({"role": "user", "content": "\n".join(text_chunks)})
 
             for fr in tool_responses:
                 name = fr.get("name", "")
@@ -1190,16 +1250,11 @@ def _to_openai_messages(contents):
                     content = str(resp.get("result", json.dumps(resp)))
                 else:
                     content = str(resp)
-
                 queue = id_queues.get(name) or []
                 call_id = queue.pop(0) if queue else next_id(name)
                 id_queues[name] = queue
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": content,
-                })
+                messages.append({"role": "tool", "tool_call_id": call_id,
+                                 "content": content})
 
         elif role == "model":
             text_chunks = []
@@ -1216,21 +1271,13 @@ def _to_openai_messages(contents):
                     tool_calls.append({
                         "id": call_id,
                         "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": json.dumps(args),
-                        },
+                        "function": {"name": name, "arguments": json.dumps(args)},
                     })
-
             msg = {"role": "assistant"}
-            if text_chunks:
-                msg["content"] = "\n".join(text_chunks)
-            else:
-                msg["content"] = None
+            msg["content"] = "\n".join(text_chunks) if text_chunks else None
             if tool_calls:
                 msg["tool_calls"] = tool_calls
             messages.append(msg)
-
     return messages
 
 
@@ -1266,18 +1313,14 @@ def _call_gemini(contents, stream=True):
         },
     }
     body = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "x-goog-api-key": api_key,
-    }
+    headers = {"Content-Type": "application/json", "x-goog-api-key": api_key}
 
     url = _gemini_url(model, stream)
     resp = None
 
     for attempt in range(CONFIG["max_retries"]):
         try:
-            req = urllib.request.Request(url, data=body,
-                                         headers=headers, method="POST")
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             resp = urllib.request.urlopen(req, timeout=CONFIG["request_timeout"])
             break
         except urllib.error.HTTPError as e:
@@ -1423,8 +1466,7 @@ def _call_openai(contents, stream=True):
 
     for attempt in range(CONFIG["max_retries"]):
         try:
-            req = urllib.request.Request(url, data=body,
-                                         headers=headers, method="POST")
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             resp = urllib.request.urlopen(req, timeout=CONFIG["request_timeout"])
             break
         except urllib.error.HTTPError as e:
@@ -1469,10 +1511,9 @@ def _call_openai(contents, stream=True):
         return
 
     collected_text = []
-    tool_slots = {}  # index -> {"id": ..., "name": ..., "args": ...}
+    tool_slots = {}
 
     def parse_full(obj):
-        """Non-streaming response: extract text and tool_calls."""
         for choice in obj.get("choices", []):
             msg = choice.get("message", {})
             text = msg.get("content")
@@ -1485,11 +1526,7 @@ def _call_openai(contents, stream=True):
                 except json.JSONDecodeError:
                     args = {}
                 idx = len(tool_slots)
-                tool_slots[idx] = {
-                    "id": tc.get("id", ""),
-                    "name": fn.get("name", ""),
-                    "args": args,
-                }
+                tool_slots[idx] = {"name": fn.get("name", ""), "args": args}
 
     try:
         if stream:
@@ -1518,12 +1555,8 @@ def _call_openai(contents, stream=True):
                             for tc in delta.get("tool_calls") or []:
                                 idx = tc.get("index", 0)
                                 slot = tool_slots.setdefault(idx, {
-                                    "id": "",
-                                    "name": "",
-                                    "args_str": "",
+                                    "id": "", "name": "", "args_str": ""
                                 })
-                                if tc.get("id"):
-                                    slot["id"] = tc["id"]
                                 fn = tc.get("function", {}) or {}
                                 if fn.get("name"):
                                     slot["name"] += fn["name"]
@@ -1543,7 +1576,6 @@ def _call_openai(contents, stream=True):
         except Exception:
             pass
 
-    # Normalize tool calls
     final_tools = []
     for idx in sorted(tool_slots.keys()):
         slot = tool_slots[idx]
@@ -1821,8 +1853,7 @@ def run_chat(existing_sid=None, existing_contents=None):
                 CONFIG["active_provider"] = arg
                 save_config()
                 if not get_api_key(arg):
-                    print(f"{C.YELLOW}{PROVIDERS[arg]['label']} has no key — "
-                          f"open settings or use /provider (no arg) for the picker{C.RESET}\n")
+                    print(f"{C.YELLOW}{PROVIDERS[arg]['label']} has no key{C.RESET}\n")
                     continue
                 if not get_model(arg):
                     print(f"{C.GREY}discovering models for {arg}…{C.RESET}")
@@ -1955,7 +1986,7 @@ def show_about():
     clear_screen()
     print(BANNER)
     print(f"{C.BOLD}fluffcode · v{VERSION}{C.RESET}")
-    print(f"{C.GREY}a terminal coding agent for Termux{C.RESET}\n")
+    print(f"{C.GREY}a lightweight coding agent for Termux{C.RESET}\n")
     print(f"  fork of {C.CYAN}netizen4-bit/agent042{C.RESET}")
     print(f"  rebuilt by {C.CYAN}Juan1anip{C.RESET}")
     print(f"  {C.GREY}github.com/Juan1anip/fluffcode{C.RESET}\n")
@@ -1972,6 +2003,7 @@ def show_about():
     print(f"  · 7 tools: read, write, edit, list, glob, grep, shell")
     print(f"  · auto-model discovery per provider")
     print(f"  · sessions, streaming, auto-backups, error recovery")
+    print(f"  · shell whitelist, path confinement, audit log")
     print()
     print(f"  {C.BOLD}free API keys{C.RESET}")
     for name in PROVIDER_ORDER:
@@ -1983,7 +2015,6 @@ def settings_menu():
         clear_screen()
         print(BANNER)
         print(f"{C.BOLD}settings{C.RESET}\n")
-
         name = CONFIG.get("user_name") or "(not set)"
         custom = CONFIG.get("custom_prompt") or "(none)"
         if len(custom) > 40:
@@ -1993,7 +2024,6 @@ def settings_menu():
         key = get_api_key()
         key_disp = f"{key[:8]}…{key[-4:]}" if len(key) > 16 else "(not set)"
         model = get_model() or "(auto)"
-
         print(f"  {C.YELLOW}[1]{C.RESET} name          {C.CYAN}{name}{C.RESET}")
         print(f"  {C.YELLOW}[2]{C.RESET} provider      {C.CYAN}{prov_label}{C.RESET}")
         print(f"  {C.YELLOW}[3]{C.RESET} API key       {C.CYAN}{key_disp}{C.RESET}")
@@ -2017,14 +2047,12 @@ def settings_menu():
                 print(f"{C.GREEN}✓ saved{C.RESET}"); time.sleep(0.6)
 
         elif sel == "2":
-            switch_provider_interactive()
-            time.sleep(0.4)
+            switch_provider_interactive(); time.sleep(0.4)
 
         elif sel == "3":
             v = ask(f"new API key for {prov_label}")
             if v:
                 set_provider_key(prov_name, v.strip())
-                # refresh model if it was unset
                 if not get_model(prov_name):
                     ensure_model(prov_name, quiet=False)
                 print(f"{C.GREEN}✓ saved{C.RESET}"); time.sleep(0.6)
@@ -2033,8 +2061,7 @@ def settings_menu():
             print(f"{C.GREY}fetching models for {prov_label}…{C.RESET}")
             models = discover_models(use_cache=False)
             if not models:
-                print(f"{C.RED}no models available{C.RESET}"); time.sleep(1.5)
-                continue
+                print(f"{C.RED}no models available{C.RESET}"); time.sleep(1.5); continue
             for i, m in enumerate(models, 1):
                 mark = " ← current" if m["name"] == get_model() else ""
                 print(f"  {C.YELLOW}[{i}]{C.RESET} {m['name']}{mark}")
@@ -2088,8 +2115,7 @@ def settings_menu():
             pause()
 
         elif sel == "9":
-            switch_provider_interactive()
-            time.sleep(0.4)
+            switch_provider_interactive(); time.sleep(0.4)
 
 
 def main_menu():
@@ -2108,13 +2134,11 @@ def main_menu():
         elif choice in ("2", "load", "l"):
             load_session_interactive()
         elif choice in ("3", "list", "sessions", "s"):
-            show_sessions()
-            pause()
+            show_sessions(); pause()
         elif choice in ("4", "settings", "set"):
             settings_menu()
         elif choice in ("5", "about", "a"):
-            show_about()
-            pause()
+            show_about(); pause()
         elif choice in ("6", "exit", "quit", "q"):
             return
         else:
@@ -2167,6 +2191,8 @@ def main():
         if not ok:
             print(f"{C.GREY}setup cancelled{C.RESET}")
             return
+
+    check_dependencies()
 
     clear_screen()
     print(BANNER)
